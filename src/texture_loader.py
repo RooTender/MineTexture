@@ -3,7 +3,21 @@ import io
 import zipfile
 import os
 
-class VanillaTexture:
+class TextureUtils:
+    def extract(self, path_or_bytes, dest: str):
+        with zipfile.ZipFile(path_or_bytes) as zip:
+            for member in zip.namelist():
+                if member.endswith(".png"):
+                    dest_dir = os.path.join(dest, os.path.dirname(member))
+                    os.makedirs(dest_dir, exist_ok=True)
+
+                    with zip.open(member) as source, open(
+                        os.path.join(dest_dir, os.path.basename(member)), "wb"
+                    ) as target:
+                        target.write(source.read())
+
+
+class VanillaTexture(TextureUtils):
 
     def __init__(self) -> None:
         self.storage_dir = os.path.join('data', 'vanilla')
@@ -37,12 +51,9 @@ class VanillaTexture:
             os.removedirs(download_dir)
             os.makedirs(download_dir)
 
-        with zipfile.ZipFile(jar_bytes) as jar:
-            for member in jar.namelist():
-                if member.endswith(".png"):
-                    dest_dir = os.path.join(download_dir, os.path.dirname(member))
-                    os.makedirs(dest_dir, exist_ok=True)
-                    with jar.open(member) as source, open(
-                        os.path.join(dest_dir, os.path.basename(member)), "wb"
-                    ) as target:
-                        target.write(source.read())
+        self.extract(jar_bytes, download_dir)
+
+class StyledTexture:
+    def __init__(self, style_name: str) -> None:
+        self.storage_dir = os.path.join('data', style_name)
+        os.makedirs(self.storage_dir, exist_ok=False)
