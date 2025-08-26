@@ -96,7 +96,7 @@ class TexturePairDataset(Dataset):
             "mask_s": ms
         }
 
-from canvas_model import TinyUNet, TinyUNetPlus
+from canvas_diffusion import DiffUNet, ddim_infer, default_sigmas, from_n11, to_n11
 from canvas_losses import l1_rgba_weighted, edge_loss
 from torchvision.utils import make_grid
 
@@ -105,11 +105,16 @@ from torch.utils.data import DataLoader, random_split
 
 import wandb
 
-LR = 1e-3
+LR = 3e-4
 WEIGHT_DECAY = 2e-4
 BASE = 32
 EPOCHS = 50
 BATCH_SIZE = 64
+
+DIFF_STEPS      = 3      # 3 albo 4
+P_SELFCOND      = 0.5    # prawdopodobieństwo self-conditioning
+P_CFG_DROPOUT   = 0.10   # ile razy uczymy "uncond"
+AUX_LOSS_WEIGHT = 0.25   # waga Twoich L1/edge dla małych sigma
 
 device = "cuda"
 
@@ -135,105 +140,176 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
-model = TinyUNetPlus(in_ch=4, base=BASE, out_ch=4).to(device, memory_format=torch.channels_last)
+model = DiffUNet(in_ch=4, base=BASE, out_ch=4).to(device, memory_format=torch.channels_last)
 
 opt = torch.optim.AdamW(
     model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
     betas=(0.9, 0.99), eps=1e-8, fused=True
 )
 
-# from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import OneCycleLR
 
-# first_cycle_epochs = 5          # np. 5 epok w pierwszym cyklu
-# scheduler = CosineAnnealingWarmRestarts(
-#     opt,
-#     T_0 = len(train_dl) * first_cycle_epochs,
-#     T_mult = 2,                 # każdy kolejny cykl 2x dłuższy
-#     eta_min = 1e-4              # albo np. LR/10
-# )
+scheduler = OneCycleLR(
+    opt,
+    max_lr = LR * 2,                # spróbuj 2–3x bazowego
+    epochs = EPOCHS,
+    steps_per_epoch = len(train_dl),
+    pct_start = 0.1,                # 20% czasu na wzrost
+    anneal_strategy = 'cos',
+    div_factor = 10,                # start_lr = max_lr / 10
+    final_div_factor = 20           # final_lr = max_lr / 20
+)
 
 def to_device_channels_last(x):
     return x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
 
-import torch.nn.functional as F
-
-def calc_losses(pred_img, vanilla, target, mask):
+def calc_losses(pred_img, target, mask):
     base_total, l1_rgb, l1_a = l1_rgba_weighted(pred_img, target, mask)
+    le_main = edge_loss(pred_img, target, mask)  # Twój dotychczasowy
 
-    def change_focus_weight(v, s, gamma, eps=1e-4):
-        diff_rgb = torch.abs(v[:,:3] - s[:,:3]).mean(dim=1, keepdim=True)
-        diff_a   = torch.abs(v[:, 3:4] - s[:, 3:4])
-        diff     = (diff_rgb + diff_a) * 0.5
-
-        w = (diff + eps) ** gamma
-        w = w / (w.mean(dim=[1,2,3], keepdim=True) + 1e-6)
-        return w
-    
-    def smooth_w(w, k=3):
-        return F.avg_pool2d(w, kernel_size=k, stride=1, padding=k//2)
-
-    w_focus = change_focus_weight(vanilla, target, gamma=1.0)
-    w_focus = smooth_w(w_focus, k=3)
-    l1_focal = (w_focus * mask * torch.abs(pred_img - target)).mean()
-
-    e_loss = edge_loss(pred_img, target, mask)
-    loss = base_total + 0.5 * (l1_focal + e_loss)
+    loss = base_total + 0.5*le_main
 
     return {
         "loss": loss,
-        "edge": e_loss,
-        "focal": l1_focal,
+        "edge": le_main,
         "l1_rgb": l1_rgb,
         "l1_a": l1_a,
     }
 
 def train_step(batch):
     model.train()
-    v = to_device_channels_last(batch["vanilla"])
-    s = to_device_channels_last(batch["styled"])
-    ms = to_device_channels_last(batch["mask_s"])
 
-    pred = (model(v)).clamp(0, 1)
-    losses = calc_losses(pred, v, s, ms)
+    v01 = to_device_channels_last(batch["vanilla"])
+    s01 = to_device_channels_last(batch["styled"])
+    ms  = to_device_channels_last(batch["mask_s"])
+    v   = to_n11(v01)
+    x0  = to_n11(s01)
 
-    losses["loss"].backward()
-    opt.step()
-    # scheduler.step()
+    B = v.size(0); device = v.device
+
+    def sample_sigma(B, sigma_min=0.01, sigma_max=0.7, device=None):
+        u = torch.rand(B, device=device)
+        return sigma_min * (sigma_max / sigma_min) ** u
+
+    sigma = sample_sigma(B, 0.01, 0.7, device)
+    sb = sigma.view(B,1,1,1)
+
+    eps_true = torch.randn_like(x0)
+    x_t = x0 + sb * eps_true
+
+    # --- self-conditioning: 50% teacher-forcing, 50% puste ---
+    use_tf = torch.rand(()) < P_SELFCOND  # P_SELFCOND = 0.5
+    if use_tf:
+        with torch.no_grad():
+            eps_tf = model(v, x_t, sigma)          # ε_tf
+            x0_sc  = (x_t - sb * eps_tf).detach()  # x0_hat (teacher forcing)
+    else:
+        x0_sc = torch.zeros_like(x_t)
+
+    # CFG dropout (uncond)
+    v_in = torch.zeros_like(v) if (torch.rand(()) < P_CFG_DROPOUT) else v
+
+    eps_hat = model(v_in, x_t, sigma, x0_sc)
+    x0_hat = x_t - sb * eps_hat
+    x0_hat01 = from_n11(x0_hat).clamp(0,1)
+
+    # --- główny loss: na x0 (L1 + edge) z maską ---
+    main = calc_losses(x0_hat01, s01, ms)["loss"]
+
+    # (opcjonalny) mały składnik na ε – pomaga uśredniać szum
+    eps_mse = torch.mean((eps_hat - eps_true) ** 2)
+
+    loss = main + 0.1 * eps_mse  # 0.1 zwykle wystarcza
+
     opt.zero_grad(set_to_none=True)
-    
-    return { 
-        "loss": float(losses['loss'].item()),
-        "edge": float(losses['edge'].item()),
-        "focal": float(losses['focal'].item()),
-        "l1_rgb": float(losses['l1_rgb'].item()),
-        "l1_a": float(losses['l1_a'].item())
-    }
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # stabilizator
+    opt.step()
+    scheduler.step()
+
+    return {"loss": float(loss.item()), "x0_main": float(main.item()), "eps_mse": float(eps_mse.item())}
+
 
 @torch.no_grad()
-def val_step(batch, preview = False):
+def val_step_like_train(batch):
     model.eval()
-    v  = to_device_channels_last(batch["vanilla"])
-    s  = to_device_channels_last(batch["styled"])
-    ms = to_device_channels_last(batch["mask_s"])
+    v01 = to_device_channels_last(batch["vanilla"])
+    s01 = to_device_channels_last(batch["styled"])
+    ms  = to_device_channels_last(batch["mask_s"])
 
-    pred = (model(v)).clamp(0, 1)
-    losses = calc_losses(pred, v, s, ms)
+    v   = to_n11(v01)
+    x0  = to_n11(s01)
+    B   = v.size(0); device = v.device
+
+    # losuj sigma z tego samego rozkładu co w train
+    def sample_sigma(B, sigma_min=0.01, sigma_max=0.7, device=None):
+        u = torch.rand(B, device=device)
+        return sigma_min * (sigma_max / sigma_min) ** u
+    sigma = sample_sigma(B, 0.01, 0.7, device)
+    sb = sigma.view(B,1,1,1)
+
+    eps_true = torch.randn_like(x0)
+    x_t = x0 + sb * eps_true
+
+    # bez TF i CFG-drop (czysta ewaluacja)
+    eps_hat = model(v, x_t, sigma, torch.zeros_like(x_t))
+    x0_hat01 = from_n11(x_t - sb * eps_hat).clamp(0,1)
+
+    losses = calc_losses(x0_hat01, s01, ms)
+    return {"loss": float(losses["loss"].item())}
+
+
+
+@torch.no_grad()
+def val_inference(batch, preview = False):
+    model.eval()
+    v01 = to_device_channels_last(batch["vanilla"])
+    s01 = to_device_channels_last(batch["styled"])
+    ms  = to_device_channels_last(batch["mask_s"])
+
+    # generacja w 3 krokach (szybko) + delikatny guidance
+    pred01 = ddim_infer(model, v01, steps=DIFF_STEPS, cfg_scale=1.5, use_sc=True)
+
+    losses = calc_losses(pred01, s01, ms)
 
     sample = None
     if preview:
         k = 4
-        grid = torch.cat([v[:k].float(), s[:k].float(), pred[:k].float()], dim=0)
+        grid = torch.cat([v01[:k], s01[:k], pred01[:k]], dim=0)
         grid = make_grid(grid, nrow=k)
-        
         sample = wandb.Image(grid, caption="(vanilla | styled | pred)")
 
-    return {
-        "loss": float(losses['loss'].item()),
-        "edge": float(losses['edge'].item()),
-        "focal": float(losses['focal'].item()),
-        "l1_rgb": float(losses['l1_rgb'].item()),
-        "l1_a": float(losses['l1_a'].item())
-    }, sample
+    return { "loss": float(losses['loss'].item()) }, sample
+
+
+@torch.inference_mode()
+def val_step(val_dl, epoch):
+    gen_acc, x0_acc = {}, {}
+    n = 0
+    sample_img = None
+    first = True
+
+    for batch in tqdm(val_dl, desc=f"Validating ({epoch+1}/{EPOCHS})"):
+        # 1) Generation (DDIM)
+        gen_metrics, sample = val_inference(batch, preview=first)
+        if sample_img is None: sample_img = sample
+
+        # 2) Train-like (single step, jak w train)
+        x0_metrics = val_step_like_train(batch)
+
+        bs = batch["vanilla"].size(0)
+        def add(acc, d): 
+            for k,v in d.items(): acc[k] = acc.get(k,0.0) + float(v)*bs
+
+        add(gen_acc, {"loss": gen_metrics["loss"]})
+        add(x0_acc,  {"loss": x0_metrics["loss"]})
+        n += bs
+        first = False
+
+    gen_mean = {k: v/max(1,n) for k,v in gen_acc.items()}
+    x0_mean  = {k: v/max(1,n) for k,v in x0_acc.items()}
+    return gen_mean, x0_mean, sample_img
+
 
 outdir = "runs/quickcheck"
 
@@ -245,7 +321,7 @@ wandb.init(
         "weight-decay": WEIGHT_DECAY,
         "base": BASE,
         "epochs": EPOCHS,
-        "model": "TinyUNet",
+        "model": "DiffUNet-miniDDIM",
     }
 )
 
@@ -262,53 +338,30 @@ def reduce_mean(sums, denom):
 best_val = float("inf")
 
 for epoch in range(EPOCHS):
-    metrics_summary = {}
-
-    metrics_acc = {}
-    batches_sum = 0
+    model.train()
+    train_acc, n = {}, 0
 
     for batch in tqdm(train_dl, desc=f"Training ({epoch+1}/{EPOCHS})"):
-        metrics = train_step(batch)
+        m = train_step(batch)
+        bs = batch["vanilla"].size(0); n += bs
+        for k,v in m.items(): train_acc[k] = train_acc.get(k,0.0) + float(v)*bs
+    train_mean = {k: v/max(1,n) for k,v in train_acc.items()}
 
-        batch_size = batch["vanilla"].size(0)
-        metrics_acc = reduce_add(metrics_acc, metrics, batch_size)
+    model.eval()
+    gen_mean, x0_mean, sample_img = val_step(val_dl, epoch)
 
-        batches_sum += batch_size
+    metrics_summary = {}
+    metrics_summary.update({f"train/{k}": v for k,v in train_mean.items()})
+    metrics_summary.update({f"valid_gen/{k}": v for k,v in gen_mean.items()})
+    metrics_summary.update({f"valid_x0/{k}":  v for k,v in x0_mean.items()})
+    metrics_summary["lr"] = scheduler.get_last_lr()[0]
+    metrics_summary["valid/sample"] = sample_img
 
-    metrics_summary.update({**{
-        f"train/{k}": v for k, v in reduce_mean(metrics_acc, batches_sum).items()
-    }})
+    wandb.log(metrics_summary)
 
-    metrics_acc = {}
-    batches_sum = 0
+    if metrics_summary["valid_x0/loss"] < best_val:
+        best_val = metrics_summary["valid_x0/loss"]
 
-    first_step = True
-    sample_img = None
-
-    for batch in tqdm(val_dl, desc=f"Validating ({epoch+1}/{EPOCHS})"):
-        metrics, sample = val_step(batch, first_step)
-        first_step = False
-
-        if sample_img is None:
-            sample_img = sample
-
-        batch_size = batch["vanilla"].size(0)
-        metrics_acc = reduce_add(metrics_acc, metrics, batch_size)
-
-        batches_sum += batch_size
-
-    metrics_summary.update({**{
-        f"valid/{k}": v for k, v in reduce_mean(metrics_acc, batches_sum).items()
-    }})
-
-    metrics_summary.update({
-        "lr": LR # opt.param_groups[0]["lr"]
-    })
-
-    metrics_summary.update({"valid/sample": sample_img})
-
-    if metrics_summary["valid/loss"] < best_val:
-        best_val = metrics_summary["valid/loss"]
         print(f"Saving model on epoch {epoch + 1} with loss: {best_val}")
         os.makedirs("checkpoints", exist_ok=True)
 
