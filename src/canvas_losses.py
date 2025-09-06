@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-@torch.jit.script
 def l1_rgba_weighted(pred, target, canvas_mask, w_alpha: float = 0.25):
     # pred/target: [B,4,H,W], canvas_mask: [B,1,H,W] (1 tam gdzie jest tekstura celu)
     pr, pa = pred[:, :3], pred[:, 3:4]
@@ -20,7 +19,6 @@ def l1_rgba_weighted(pred, target, canvas_mask, w_alpha: float = 0.25):
 
     return l1_rgb + w_alpha * l1_a, l1_rgb, l1_a
 
-@torch.jit.script
 def sobel_filter(x: torch.Tensor) -> torch.Tensor:
     gx = torch.tensor([[1.,0.,-1.],
                        [2.,0.,-2.],
@@ -33,7 +31,6 @@ def sobel_filter(x: torch.Tensor) -> torch.Tensor:
     grady = F.conv2d(x, gy.expand(C,1,3,3), padding=1, groups=C)
     return torch.sqrt(gradx * gradx + grady * grady + 1e-6)
 
-@torch.jit.script
 def edge_mask_from_alpha(a: torch.Tensor, thresh: float = 0.05, dilate: int = 1) -> torch.Tensor:
     # a: [B,1,H,W]
     g = sobel_filter(a.repeat(1,3,1,1))[:, :1]     # [B,1,H,W]
@@ -47,7 +44,6 @@ def edge_mask_from_alpha(a: torch.Tensor, thresh: float = 0.05, dilate: int = 1)
             i += 1
     return m
 
-@torch.jit.script
 def edge_loss(pred: torch.Tensor, target: torch.Tensor, canvas_mask: torch.Tensor) -> torch.Tensor:
     pr, tr = pred[:, :3], target[:, :3]
     gp = sobel_filter(pr)
@@ -56,3 +52,28 @@ def edge_loss(pred: torch.Tensor, target: torch.Tensor, canvas_mask: torch.Tenso
     w = torch.clamp(canvas_mask + 2.0 * edge_m, 0.0, 3.0)
     num = w.sum().clamp_min(1e-6)
     return ((gp - gt).abs() * w.repeat(1,3,1,1)).sum() / num
+
+def isolated_alpha_loss(
+    pred: torch.Tensor,
+    canvas_mask: torch.Tensor,
+    thr: float = 0.5,
+    temp: float = 10.0,
+    k: int = 3
+) -> torch.Tensor:
+    # pred: Bx4xHxW, mask: Bx1xHxW
+    a = pred[:, 3:4]                        # Bx1xHxW
+    b = torch.sigmoid((a - thr) * temp)     # miękkie ~{0,1}
+
+    # suma w oknie k×k (z zerowym paddingiem dla conv2d -> padding=k//2)
+    kernel = torch.ones((1, 1, k, k), device=pred.device, dtype=pred.dtype)
+    sum_all = F.conv2d(b, kernel, padding=k // 2)  # Bx1xHxW
+
+    # suma sąsiadów = suma okna - piksel centralny
+    neigh_sum = sum_all - b
+    denom = float(k * k - 1)
+    neigh_avg = neigh_sum / denom
+
+    # kara za „wysepki” / „dziury”
+    iso_score = b * (1.0 - neigh_avg) + (1.0 - b) * neigh_avg
+
+    return (iso_score * canvas_mask[:, :1]).mean()

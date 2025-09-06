@@ -14,7 +14,7 @@ class Block(nn.Module):
         self.c2 = conv3(out_c, out_c)
         self.n1 = nn.GroupNorm(1, out_c)
         self.n2 = nn.GroupNorm(1, out_c)
-        self.act = nn.SiLU()
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x):
         # manual circular pad (PyTorch Conv2d nie ma padding_mode='circular' z autogradem na wszystkich wersjach)
@@ -114,9 +114,10 @@ class ResBlock(nn.Module):
         y = self.c2(y); y = self.n2(y)
         y = self.se(y)
         y = self.sa(y)
-        y = x if isinstance(self.skip, nn.Identity) else self.skip(x) + self.scale * y
+        res = self.skip(x)
+
         # (x->1x1) + scaled residual – stabilniej przy większym "base"
-        return self.act(y)
+        return self.act(res + self.scale * y)
 
 # --- MHSA tylko w bottlenecku: HW=8x8 przy 32x32 ---
 class BottleneckMHSA(nn.Module):
@@ -141,12 +142,27 @@ class BottleneckMHSA(nn.Module):
         y = self.proj(y)
         # residual z lekkim skalowaniem – nie rozjeżdża treningu
         return self.norm(x + self.scale * y)
+    
+class GatedSkip(nn.Module):
+    def __init__(self, c_low, c_high):
+        super().__init__()
+        # prosta bramka: 1x1 nad złączonym tensorem -> sigmoid
+        self.gate = nn.Sequential(
+            nn.Conv2d(c_low + c_high, c_high, 1, bias=True),
+            nn.Sigmoid()
+        )
+    def forward(self, low, high):   # low=skip z enkodera, high=cecha z dekodera
+        g = self.gate(torch.cat([low, high], dim=1))
+        return high * g + low * (1 - g)
 
 class TinyUNetPlus(nn.Module):
     def __init__(self, in_ch=4, base=32, out_ch=4,
                  se=True, spatial=True, heads=4):
         super().__init__()
         c1, c2, c3 = base, base*2, base*4
+
+        # self.g1 = GatedSkip(c2, c2)
+        # self.g2 = GatedSkip(c1, c1)
 
         self.b1 = ResBlock(in_ch, c1, use_se=se, use_spatial=spatial, scale=0.2)
         self.d1 = nn.Conv2d(c1, c2, 4, 2, 1)      # zostawiamy nearest+conv w up
@@ -172,10 +188,12 @@ class TinyUNetPlus(nn.Module):
 
         y  = F.interpolate(x3, scale_factor=2, mode='nearest')
         y  = self.up1(y)
+        # y  = self.g1(x2, y)
         y  = self.b4(torch.cat([y, x2], dim=1))
 
         y  = F.interpolate(y, scale_factor=2, mode='nearest')
         y  = self.up2(y)
+        # y  = self.g2(x1, y)
         y  = self.b5(torch.cat([y, x1], dim=1))
 
-        return x + self.out(y)   # residual head (RGBA)
+        return x + self.out(y)

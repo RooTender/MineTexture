@@ -1,103 +1,80 @@
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from tqdm import tqdm
-import random
 
-BASE_MAX_DIM = 16
 
-class TexturePairDataset(Dataset):
-    """
-    Paruje pliki vanilla <-> styled po identycznej ścieżce relatywnej.
-    Jeśli styled/<rel_path> nie istnieje -> pomijamy.
-    """
-    def __init__(
-        self,
-        root_vanilla: str,
-        root_styled: str,
-        styled_scale: int = 1
-    ):
-        self.root_v = Path(root_vanilla)
-        self.root_s = Path(root_styled)
-        self.styled_scale = styled_scale
+class TexturePairs(Dataset):
+    def __init__(self, root_vanilla: str, root_styled: str):
+        self.v_root = Path(root_vanilla)
+        self.s_root = Path(root_styled)
 
-        self.pairs: List[Tuple[Path, Path]] = []
-
-        files = list(self.root_v.rglob("*"))
-        for p_v in tqdm(files, desc="Loading textures..."):
-            if not p_v.is_file():
+        # Zindeksuj styled: rel_ścieżka (względem bucketa) -> pełna ścieżka
+        self.styled_map = {}
+        for s_bucket in sorted(self.s_root.glob("x*")):
+            if not s_bucket.is_dir():
                 continue
+            for p_s in s_bucket.rglob("*"):
+                if p_s.is_file():
+                    rel = p_s.relative_to(s_bucket)
+                    self.styled_map[str(rel).replace("\\", "/")] = p_s
 
-            with Image.open(p_v) as img:
-                width, height = img.size
-
-                if width > BASE_MAX_DIM or height > BASE_MAX_DIM:
+        # Zbierz pary (vanilla, styled) po tej samej rel_ścieżce
+        self.pairs: List[Tuple[Path, Path]] = []
+        for v_bucket in sorted(self.v_root.glob("x*")):
+            if not v_bucket.is_dir():
+                continue
+            for p_v in v_bucket.rglob("*"):
+                if not p_v.is_file():
                     continue
+                rel = str(p_v.relative_to(v_bucket)).replace("\\", "/")
+                p_s = self.styled_map.get(rel, None)
+                if p_s is not None:
+                    self.pairs.append((p_v, p_s))
 
-            rel = p_v.relative_to(self.root_v)
-            p_s = self.root_s / rel
+        self.pairs.sort(key=lambda t: (str(t[0]).lower(), str(t[1]).lower()))
 
-            if p_s.is_file():
-                with Image.open(p_s) as img:
-                    width, height = img.size
+    @staticmethod
+    def _load_rgba(path: Path) -> Image.Image:
+        with Image.open(path) as img:
+            return img.convert("RGBA")
 
-                    if width > BASE_MAX_DIM * styled_scale or height > BASE_MAX_DIM * styled_scale:
-                        continue
-
-                self.pairs.append((p_v, p_s))
+    @staticmethod
+    def _to_tensor(img: Image.Image) -> torch.Tensor:
+        arr = np.array(img, dtype=np.uint8)           # H W 4
+        return torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def __getitem__(self, idx: int) -> Dict:
         p_v, p_s = self.pairs[idx]
+        img_v = self._load_rgba(p_v)
+        img_s = self._load_rgba(p_s)
 
-        def to_rgba_and_scale(path: str, scale: int = 1) -> torch.Tensor:
-            with Image.open(path) as img:
-                if img.mode != "RGBA":
-                    img = img.convert("RGBA")
-
-                if scale != 1:
-                    w, h = img.size
-                    img = img.resize((w * scale, h * scale), resample=Image.Resampling.NEAREST)
-
-                arr = np.array(img, dtype=np.uint8)
-            t = torch.from_numpy(arr).permute(2,0,1)
-
-            return t.to(torch.float32) / 255.0
-
-        tv = to_rgba_and_scale(p_v, self.styled_scale)
-        ts = to_rgba_and_scale(p_s)
-
-        def to_canvas_and_mask(x: torch.Tensor, canvas: int, ox: Optional[int]=None, oy: Optional[int]=None):
-            _, h, w = x.shape
-            y = torch.zeros((4, canvas, canvas), dtype=x.dtype)
-            m = torch.zeros((1, canvas, canvas), dtype=x.dtype)
-
-            max_y = canvas - h
-            max_x = canvas - w
-            if oy is None: oy = random.randint(0, max_y) if max_y > 0 else 0
-            if ox is None: ox = random.randint(0, max_x) if max_x > 0 else 0
-
-            y[:, oy:oy+h, ox:ox+w] = x
-            m[:, oy:oy+h, ox:ox+w] = 1.0
-            return y, m, ox, oy
-
-        tv_pad, mv, ox, oy = to_canvas_and_mask(tv, BASE_MAX_DIM * self.styled_scale)
-        ts_pad, ms, _, _   = to_canvas_and_mask(ts, BASE_MAX_DIM * self.styled_scale, ox=ox, oy=oy)
+        # Zawsze dopasuj vanilla do rozmiaru styled (piksel-art safe).
+        if img_v.size != img_s.size:
+            img_v = img_v.resize(img_s.size, resample=Image.Resampling.NEAREST)
 
         return {
-            "vanilla": tv_pad,
-            "mask_v": mv,
-            "styled": ts_pad,
-            "mask_s": ms
+            "vanilla": self._to_tensor(img_v),
+            "styled":  self._to_tensor(img_s),
         }
 
-from canvas_model import TinyUNet, TinyUNetPlus
-from canvas_losses import l1_rgba_weighted, edge_loss
+train_pairs = TexturePairs(
+    root_vanilla="data/augmented/train/vanilla",
+    root_styled="data/augmented/train/styled",
+)
+
+valid_pairs = TexturePairs(
+    root_vanilla="data/augmented/valid/vanilla",
+    root_styled="data/augmented/valid/styled",
+)
+
+from canvas_model import TinyUNetPlus
+from canvas_losses import l1_rgba_weighted, edge_loss, isolated_alpha_loss
 from torchvision.utils import make_grid
 
 import torch, os
@@ -105,19 +82,15 @@ from torch.utils.data import DataLoader, random_split
 
 import wandb
 
-LR = 1e-3
-WEIGHT_DECAY = 2e-4
+LR = 5e-4
+WEIGHT_DECAY = 1e-4
 BASE = 32
-EPOCHS = 50
-BATCH_SIZE = 64
+EPOCHS = 250
+BATCH_SIZE = 256
 
 device = "cuda"
 
-ds = TexturePairDataset(
-    root_vanilla="data/augmented/vanilla",
-    root_styled="data/augmented/styled",
-    styled_scale=2,
-)
+
 
 n_val = max(1, int(len(ds) * 0.2))
 n_train = len(ds) - n_val
@@ -125,32 +98,29 @@ train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator(
 
 train_dl = DataLoader(train_ds, 
                       batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True, 
-                      persistent_workers=True, pin_memory_device="cuda", prefetch_factor=2)
+                      persistent_workers=True, pin_memory_device="cuda", prefetch_factor=4)
 
 val_dl   = DataLoader(val_ds,   
-                      batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, 
-                      persistent_workers=True, pin_memory_device="cuda", prefetch_factor=2)
+                      batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, 
+                      persistent_workers=True, pin_memory_device="cuda", prefetch_factor=4)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
+use_bf16 = torch.cuda.is_bf16_supported()
+amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
 model = TinyUNetPlus(in_ch=4, base=BASE, out_ch=4).to(device, memory_format=torch.channels_last)
+
+compile_mode = "reduce-overhead"
+model = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=False)
 
 opt = torch.optim.AdamW(
     model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
     betas=(0.9, 0.99), eps=1e-8, fused=True
 )
-
-# from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-
-# first_cycle_epochs = 5          # np. 5 epok w pierwszym cyklu
-# scheduler = CosineAnnealingWarmRestarts(
-#     opt,
-#     T_0 = len(train_dl) * first_cycle_epochs,
-#     T_mult = 2,                 # każdy kolejny cykl 2x dłuższy
-#     eta_min = 1e-4              # albo np. LR/10
-# )
 
 def to_device_channels_last(x):
     return x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -176,13 +146,16 @@ def calc_losses(pred_img, vanilla, target, mask):
     w_focus = smooth_w(w_focus, k=3)
     l1_focal = (w_focus * mask * torch.abs(pred_img - target)).mean()
 
+    island_loss = isolated_alpha_loss(pred_img, mask)
+
     e_loss = edge_loss(pred_img, target, mask)
-    loss = base_total + 0.5 * (l1_focal + e_loss)
+    loss = base_total + 0.5 * l1_focal + 0.15 * e_loss + 0.10 * island_loss
 
     return {
         "loss": loss,
         "edge": e_loss,
         "focal": l1_focal,
+        "island": island_loss,
         "l1_rgb": l1_rgb,
         "l1_a": l1_a,
     }
@@ -193,21 +166,15 @@ def train_step(batch):
     s = to_device_channels_last(batch["styled"])
     ms = to_device_channels_last(batch["mask_s"])
 
-    pred = (model(v)).clamp(0, 1)
-    losses = calc_losses(pred, v, s, ms)
+    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+        pred = model(v)
+        losses = calc_losses(pred, v, s, ms)
 
     losses["loss"].backward()
     opt.step()
-    # scheduler.step()
     opt.zero_grad(set_to_none=True)
     
-    return { 
-        "loss": float(losses['loss'].item()),
-        "edge": float(losses['edge'].item()),
-        "focal": float(losses['focal'].item()),
-        "l1_rgb": float(losses['l1_rgb'].item()),
-        "l1_a": float(losses['l1_a'].item())
-    }
+    return {k: float(v.item() if torch.is_tensor(v) else v) for k, v in losses.items()}
 
 @torch.no_grad()
 def val_step(batch, preview = False):
@@ -216,8 +183,9 @@ def val_step(batch, preview = False):
     s  = to_device_channels_last(batch["styled"])
     ms = to_device_channels_last(batch["mask_s"])
 
-    pred = (model(v)).clamp(0, 1)
-    losses = calc_losses(pred, v, s, ms)
+    with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+        pred = (model(v)).clamp(0, 1)
+        losses = calc_losses(pred, v, s, ms)
 
     sample = None
     if preview:
@@ -227,13 +195,7 @@ def val_step(batch, preview = False):
         
         sample = wandb.Image(grid, caption="(vanilla | styled | pred)")
 
-    return {
-        "loss": float(losses['loss'].item()),
-        "edge": float(losses['edge'].item()),
-        "focal": float(losses['focal'].item()),
-        "l1_rgb": float(losses['l1_rgb'].item()),
-        "l1_a": float(losses['l1_a'].item())
-    }, sample
+    return {k: float(v.item() if torch.is_tensor(v) else v) for k, v in losses.items()}, sample
 
 outdir = "runs/quickcheck"
 
@@ -312,9 +274,15 @@ for epoch in range(EPOCHS):
         print(f"Saving model on epoch {epoch + 1} with loss: {best_val}")
         os.makedirs("checkpoints", exist_ok=True)
 
+        def unwrap_state_dict(m: torch.nn.Module):
+            return m._orig_mod.state_dict() if hasattr(m, "_orig_mod") else m.state_dict()
+
         ckpt_path = f"checkpoints/best_epoch_{epoch}.pt"
-        torch.save({"model": model.state_dict(),
-                    "opt": opt.state_dict(),
-                    "epoch": epoch}, ckpt_path)
+        torch.save({
+            "model": unwrap_state_dict(model),
+            "opt": opt.state_dict(),
+            "epoch": epoch
+            }, ckpt_path
+        )
 
     wandb.log(metrics_summary)
