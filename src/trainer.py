@@ -138,56 +138,6 @@ def collate_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "bin":     bucket_key,
     }
 
-
-class BucketBatchSampler(Sampler[List[int]]):
-    """
-    Tworzy batch'e tylko z jednego kosza (np. x16), a kosze podaje round-robin.
-    Dla rzadkich koszy robi oversampling, żeby domknąć pełne batch'e.
-    """
-    def __init__(self, dataset: TexturePairs, batch_size: int = 4, shuffle: bool = True):
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        # indeksy per kosz
-        buckets = defaultdict(list)
-        for i, b in enumerate(dataset.bins):
-            buckets[b].append(i)
-        self.buckets = {k: v[:] for k, v in buckets.items()}
-        self.bucket_keys = sorted(self.buckets.keys(), key=lambda k: (len(self.buckets[k])==0, k))
-
-    def __iter__(self):
-        # przygotuj kolejki per kosz
-        qs = {}
-        for k in self.bucket_keys:
-            q = self.buckets[k][:]
-            if self.shuffle: random.shuffle(q)
-            # oversampling do wielokrotności batch_size
-            need = (-len(q)) % self.batch_size
-            if need and len(q) > 0:
-                q += random.choices(q, k=need)
-            qs[k] = q
-
-        # ile batchy per kosz
-        per_bucket_batches = {k: len(v)//self.batch_size for k, v in qs.items()}
-        maxb = max(per_bucket_batches.values()) if per_bucket_batches else 0
-
-        # round-robin po koszach
-        ptr = {k: 0 for k in self.bucket_keys}
-
-        for _ in range(maxb):
-            for k in self.bucket_keys:
-                nb = per_bucket_batches[k]
-                if nb == 0: continue
-                if ptr[k] >= len(qs[k]): continue
-                batch = qs[k][ptr[k]:ptr[k]+self.batch_size]
-                ptr[k] += self.batch_size
-                if batch: yield batch
-
-    def __len__(self):
-        total = 0
-        for v in self.buckets.values():
-            total += math.ceil(len(v)/self.batch_size) if v else 0
-        return total
-
 class BlockBucketBatchSampler(Sampler[List[int]]):
     def __init__(self, dataset: TexturePairs, batch_size: int = 4, block_batches: int = 32, shuffle: bool = True):
         self.batch_size = batch_size; self.block_batches = block_batches; self.shuffle = shuffle
@@ -257,12 +207,12 @@ torch.backends.cudnn.benchmark = True
 model = TinyUNetLite(in_ch=4, base=BASE, out_ch=4, padding_mode='zeros').to(device)
 model = model.to(memory_format=torch.channels_last)
 
-# print("Compiling...")
-# compile_mode = "reduce-overhead"
-# import torch._dynamo as dynamo
-# dynamo.config.cache_size_limit = 64 
-# model = torch.compile(model, mode=compile_mode, dynamic=False)
-# print("Done")
+print("Compiling...")
+compile_mode = "reduce-overhead"
+import torch._dynamo as dynamo
+dynamo.config.cache_size_limit = 64 
+model = torch.compile(model, mode=compile_mode, dynamic=False)
+print("Done")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, fused=True)
 
@@ -281,7 +231,7 @@ def depth_from_bin(bucket_key: str) -> int:
     return 2  # x128, x256, x512...
 
 
-def run_epoch(dloader, train=True):
+def run_epoch(dloader, train: bool, epoch: int, epochs: int):
     model.train(train)
     ctx = torch.enable_grad() if train else torch.no_grad()
 
@@ -292,13 +242,17 @@ def run_epoch(dloader, train=True):
     amp_dtype = torch.bfloat16 if major >= 8 else torch.float16
     amp_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype)
 
+    description = "Training" if train is True else "Validating"
+    description = f"{description} ({epoch}/{epochs})"
+
     with ctx:
-        for batch in tqdm(dloader):
+        for batch in tqdm(dloader, desc=description):
             x = batch["vanilla"].to(device, non_blocking=True).to(torch.float32).div_(255.0).contiguous(memory_format=torch.channels_last)
             y = batch["styled" ].to(device, non_blocking=True).to(torch.float32).div_(255.0).contiguous(memory_format=torch.channels_last)
             m = batch["mask"   ].to(device, non_blocking=True).to(torch.float32).contiguous(memory_format=torch.channels_last)
 
-            bname = batch["bin"]; depth = depth_from_bin(bname)
+            bname = batch["bin"]
+            depth = depth_from_bin(bname)
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
@@ -321,17 +275,20 @@ def run_epoch(dloader, train=True):
 
 
 NUM_EPOCHS = 10
-for epoch in range(1, NUM_EPOCHS+1):
-    train_avg, train_bins = run_epoch(train_dl, train=True)
-    val_avg,   val_bins   = run_epoch(val_dl,   train=False)
+for i, epoch in enumerate(range(1, NUM_EPOCHS+1)):
+    train_avg, train_bins = run_epoch(train_dl, train=True, epoch=i, epochs=NUM_EPOCHS)
+    val_avg,   val_bins   = run_epoch(val_dl,   train=False, epoch=i, epochs=NUM_EPOCHS)
 
     log = {
         "epoch": epoch,
         "train/avg": train_avg,
         "valid/avg": val_avg,
     }
-    for k,v in sorted(train_bins.items()): log[f"train/bin/{k}"] = v
-    for k,v in sorted(val_bins.items()):   log[f"valid/bin/{k}"] = v
-    # wandb.log(log)
+    train_vals = list(train_bins.values())
+    val_vals   = list(val_bins.values())
+    wandb.log({
+        "train/bin_hist": wandb.Histogram(np.array(train_vals)),
+        "valid/bin_hist": wandb.Histogram(np.array(val_vals)),
+    })
 
     print(f"[{epoch:03d}] train={train_avg:.6f}  valid={val_avg:.6f}")
