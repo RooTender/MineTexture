@@ -38,93 +38,92 @@ for file in src_vanilla.rglob("*"):
     os.makedirs(dst_s, exist_ok=True)
     shutil.copy2(styled_file, dst_s)
 
+from pathlib import Path
+import os
+import shutil
+import random
+
 sorted_root = Path("data/sorted")
 split_root  = Path("data/split")
 train_ratio = 0.8
 
 random.seed(42)
 
-vanilla_idx = {}
-styled_idx  = {}
-
 v_root = sorted_root / "vanilla"
 s_root = sorted_root / "styled"
 
+def parse_size(name: str):
+    name = name.lower().replace('×', 'x')
+    w_str, h_str = name.split('x', 1)
+    return int(w_str), int(h_str)
+
+def mul_size(name: str, k: int) -> str:
+    w, h = parse_size(name)
+    return f"{w*k}x{h*k}"
+
+# Zbierz indeksy: (nazwa_pliku, rozmiar) -> lista ścieżek
+vanilla_idx = {}
+styled_idx  = {}
+
 if v_root.exists():
-    for size_dir in v_root.iterdir():
-        if size_dir.is_dir():
-            for f in size_dir.iterdir():
-                if f.is_file():
-                    vanilla_idx[f.name] = f
+    for v_size_dir in v_root.iterdir():
+        if not v_size_dir.is_dir():
+            continue
+        v_size = v_size_dir.name
+        for f in v_size_dir.iterdir():
+            if f.is_file() and f.suffix.lower() == ".png":
+                vanilla_idx.setdefault((f.name, v_size), []).append(f)
 
 if s_root.exists():
-    for size_dir in s_root.iterdir():
-        if size_dir.is_dir():
-            for f in size_dir.iterdir():
-                if f.is_file():
-                    styled_idx[f.name] = f
+    for s_size_dir in s_root.iterdir():
+        if not s_size_dir.is_dir():
+            continue
+        s_size = s_size_dir.name
+        for f in s_size_dir.iterdir():
+            if f.is_file() and f.suffix.lower() == ".png":
+                styled_idx.setdefault((f.name, s_size), []).append(f)
 
-paired_names = list(set(vanilla_idx.keys()) & set(styled_idx.keys()))
-random.shuffle(paired_names)
+# Zbuduj pary: dla każdego (name, v_size) szukaj (name, s_size = v_size*SCALE)
+pairs = []
+for (name, v_size), v_list in vanilla_idx.items():
+    s_size = mul_size(v_size, SCALE)
+    s_list = styled_idx.get((name, s_size), [])
+    if not s_list:
+        continue
+    # ułóż losowo, by potem deterministycznie “zużywać”
+    random.shuffle(v_list)
+    random.shuffle(s_list)
+    # bierz 1:1 tyle, ile jest wspólnych sztuk
+    take = min(len(v_list), len(s_list))
+    for i in range(take):
+        v_file = v_list[i]
+        s_file = s_list[i]
+        pairs.append((v_file, s_file, v_size, s_size))
 
-split_idx = int(len(paired_names) * train_ratio)
+# potasuj pary i podziel
+random.shuffle(pairs)
+split_idx = int(len(pairs) * train_ratio)
+train_pairs = pairs[:split_idx]
+valid_pairs = pairs[split_idx:]
 
-train_names = paired_names[:split_idx]
-valid_names = paired_names[split_idx:]
-
-def copy_pair(name: str, split: str):
+def copy_pair(v_file: Path, s_file: Path, v_size: str, s_size: str, split: str):
     # VANILLA
-    v_path = vanilla_idx[name]
-    v_size = v_path.parent.name  # np. "32x32"
     dst_v_dir = split_root / split / "vanilla" / v_size
-    os.makedirs(dst_v_dir, exist_ok=True)
-    shutil.copy2(v_path, dst_v_dir)
+    dst_v_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(v_file, dst_v_dir)
 
     # STYLED
-    s_path = styled_idx[name]
-    s_size = s_path.parent.name
     dst_s_dir = split_root / split / "styled" / s_size
-    os.makedirs(dst_s_dir, exist_ok=True)
-    shutil.copy2(s_path, dst_s_dir)
+    dst_s_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(s_file, dst_s_dir)
 
-# 3) Kopiuj pary do train/valid
-for n in train_names:
-    copy_pair(n, "train")
-for n in valid_names:
-    copy_pair(n, "valid")
+# (opcjonalnie) wyczyść wcześniejszy split:
+# if split_root.exists():
+#     shutil.rmtree(split_root)
 
-SRC_ROOT = Path("data/split")  # skąd bierzemy train/valid po wstępnym splicie
-DST_ROOT = Path("data/bucket")      # dokąd tworzymy kubełki x8..x256
+for v_file, s_file, v_size, s_size in train_pairs:
+    copy_pair(v_file, s_file, v_size, s_size, "train")
+for v_file, s_file, v_size, s_size in valid_pairs:
+    copy_pair(v_file, s_file, v_size, s_size, "valid")
 
-BINS = [8, 16, 32, 64, 128, 256, 512]
-
-def pick_bin(min_side: int) -> int:
-    for b in BINS:
-        if min_side <= b:
-            return b
-    return BINS[-1]  # >256 -> x256
-
-for split in ["train", "valid"]:
-    for kind in ["vanilla", "styled"]:
-        src_kind = SRC_ROOT / split / kind
-        if not src_kind.exists():
-            continue
-
-        # iterujemy po katalogach rozmiarów (np. 16x16, 32x32), bez wchodzenia w podkatalogi
-        for size_dir in src_kind.iterdir():
-            if not size_dir.is_dir():
-                continue
-
-            for f in size_dir.iterdir():
-                if not f.is_file():
-                    continue
-
-                with Image.open(f) as img:
-                    w, h = img.size
-                bin_size = pick_bin(min(w, h))
-
-                dst_dir = DST_ROOT / split / kind / f"x{bin_size}"
-                os.makedirs(dst_dir, exist_ok=True)
-                shutil.copy2(f, dst_dir)
-
-print("Buckets done")
+print(f"Pary znalezione: {len(pairs)} | train: {len(train_pairs)} | valid: {len(valid_pairs)}")
