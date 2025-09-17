@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 from PIL import Image
 import shutil
 import random
@@ -9,6 +8,18 @@ src_styled  = Path("data/styled/Faithful 32x")
 dst_root    = Path("data/sorted")
 
 SCALE = 2  # expected ratio styled/vanilla
+
+def save_as_rgba_png(src_path: Path, dst_dir: Path) -> Path:
+    """
+    Open an image, convert to RGBA, and save as PNG (icc_profile stripped).
+    Returns the destination path.
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_path = dst_dir / (src_path.stem + ".png")
+    with Image.open(src_path) as im:
+        im = im.convert("RGBA")
+        im.save(dst_path, format="PNG", optimize=True, icc_profile=None)
+    return dst_path
 
 for file in src_vanilla.rglob("*"):
     if not file.is_file():
@@ -30,18 +41,11 @@ for file in src_vanilla.rglob("*"):
 
     # --- vanilla ---
     dst_v = dst_root / "vanilla" / f"{wv}x{hv}"
-    os.makedirs(dst_v, exist_ok=True)
-    shutil.copy2(file, dst_v)
+    save_as_rgba_png(file, dst_v)
 
     # --- styled ---
     dst_s = dst_root / "styled" / f"{ws}x{hs}"
-    os.makedirs(dst_s, exist_ok=True)
-    shutil.copy2(styled_file, dst_s)
-
-from pathlib import Path
-import os
-import shutil
-import random
+    save_as_rgba_png(styled_file, dst_s)
 
 sorted_root = Path("data/sorted")
 split_root  = Path("data/split")
@@ -116,10 +120,6 @@ def copy_pair(v_file: Path, s_file: Path, v_size: str, s_size: str, split: str):
     dst_s_dir = split_root / split / "styled" / s_size
     dst_s_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(s_file, dst_s_dir)
-
-# (opcjonalnie) wyczyść wcześniejszy split:
-# if split_root.exists():
-#     shutil.rmtree(split_root)
 
 for v_file, s_file, v_size, s_size in train_pairs:
     copy_pair(v_file, s_file, v_size, s_size, "train")

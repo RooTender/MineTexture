@@ -3,9 +3,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from functools import lru_cache
-from typing import Tuple, List, Dict
+from typing import List
 from torchvision.io import read_image, ImageReadMode
 import math
+from tqdm import tqdm
 
 TARGET = 32
 
@@ -69,26 +70,57 @@ class TexturePairDataset(Dataset):
         self.scale = int(scale)
         self.items: list[tuple[Path, Path, int | None, int | None]] = []
 
+        THRESHOLD_FULL = 0.01
+        THRESHOLD_CROP = 0.1
+
         # Indeksujemy per-patch: na etapie indeksu znamy rozmiary (bez ładowania pikseli)
-        for size_dir in sorted(self.path_a.iterdir()):
+        for size_dir in tqdm(sorted(self.path_a.iterdir()), desc="Loading dataset"):
             w, h = map(int, size_dir.name.lower().split("x"))
             target_dir = self.path_b / f"{w*self.scale}x{h*self.scale}"
 
             for img_orig in sorted(size_dir.glob("*.png")):
                 img_target = target_dir / img_orig.name
 
-                a_uint8 = _read_rgba_uint8_resized(str(img_orig), self.scale)
-                alpha = a_uint8[3]
+                a_u8 = _read_rgba_uint8_resized(img_orig, self.scale)  # [4,Hs,Ws]
+                b_u8 = _read_rgba_uint8_resized(img_target, 1)
+                alpha = a_u8[3]
                 h, w = alpha.shape
-                
+
+                with torch.no_grad():
+                    diff = (a_u8[:3] - b_u8[:3]).abs().sum().item()
+                    diff /= (3 * h * w * 255.0)
+
+                if diff < THRESHOLD_FULL:
+                    continue
+
                 # starty dla A i B w każdej osi
                 x_anchors = _get_overlap_anchors(w, TARGET)
                 y_anchors = _get_overlap_anchors(h, TARGET)
 
+                cached_crops = []
                 for y in y_anchors:
                     for x in x_anchors:
-                        if (alpha[y:(y + TARGET), x:(x + TARGET)] != 0).any():
-                            self.items.append((str(img_orig), str(img_target), x, y))
+                        if not (alpha[y:(y + TARGET), x:(x + TARGET)] != 0).any():
+                            continue
+
+                        crop = _crop_pad_32_at_uint8(a_u8, x, y)
+
+                        redundant_crop = False
+                        for cached in cached_crops:
+                            with torch.no_grad():
+                                diff = (cached[:3] - crop[:3]).abs().sum().item()
+                                diff /= (3 * TARGET * TARGET * 255.0)
+
+                            if diff < THRESHOLD_CROP:
+                                redundant_crop = True
+                                break
+
+                        if redundant_crop:
+                            continue
+
+                        cached_crops.append(crop)
+
+                        self.items.append((str(img_orig), str(img_target), x, y))
 
     def __len__(self) -> int:
         return len(self.items)
