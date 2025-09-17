@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def conv3(in_c, out_c, stride=1):
-    return nn.Conv2d(in_c, out_c, kernel_size=3, stride=stride, padding=1, padding_mode='zeros')
+    return nn.Conv2d(in_c, out_c, kernel_size=3, stride=stride, padding=1)
 
 def conv1(in_c, out_c):
     return nn.Conv2d(in_c, out_c, kernel_size=1)
@@ -15,6 +15,8 @@ class ResBlock(nn.Module):
         self.c2 = conv3(ch, ch, stride=1)
         self.act = nn.SiLU(inplace=True)
 
+        self.alpha = nn.Parameter(torch.ones(ch))
+
         nn.init.zeros_(self.c2.weight)
         if self.c2.bias is not None:
             nn.init.zeros_(self.c2.bias)
@@ -22,7 +24,7 @@ class ResBlock(nn.Module):
     def forward(self, x):
         y = self.act(self.c1(x))
         y = self.c2(y)
-        return self.act(x + y)
+        return self.act(x + self.alpha.view(1,-1,1,1) * y)
 
 class TinyUNet(nn.Module):
     """
@@ -51,13 +53,13 @@ class TinyUNet(nn.Module):
 
         # --- DECODER ---
         self.u0 = nn.ConvTranspose2d(base*4, base*4, kernel_size=4, stride=2, padding=1)  # 4->8
-        self.rb0 = ResBlock(base*4)
+        self.rb5 = ResBlock(base*4)
 
         self.u1 = nn.ConvTranspose2d(base*4, base*2, kernel_size=4, stride=2, padding=1)  # 8->16
-        self.rb5 = ResBlock(base*2)
+        self.rb6 = ResBlock(base*2)
 
         self.u2 = nn.ConvTranspose2d(base*2, base,   kernel_size=4, stride=2, padding=1)  # 16->32
-        self.rb6 = ResBlock(base)
+        self.rb7 = ResBlock(base)
 
         # --- PŁYTKI SKIP 32x32 ---
         self.skip_mix = conv1(base * 2, base)  # miks po concat([y_32, y1])
@@ -96,13 +98,13 @@ class TinyUNet(nn.Module):
 
         # Decoder
         y  = self.act(self.u0(y))   # 8x8
-        y  = self.rb0(y)
-
-        y  = self.act(self.u1(y))   # 16x16
         y  = self.rb5(y)
 
-        y  = self.act(self.u2(y))   # 32x32
+        y  = self.act(self.u1(y))   # 16x16
         y  = self.rb6(y)
+
+        y  = self.act(self.u2(y))   # 32x32
+        y  = self.rb7(y)
 
         # Skip 32x32
         y  = torch.cat([y, y1], dim=1)   # (base + base) -> 2*base
