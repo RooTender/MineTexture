@@ -45,7 +45,7 @@ edge_criterion = EdgeLoss().to(DEVICE)
 
 wandb.init(
     project="MineTexture",
-    name="skip",
+    name="clip_skip_16_8",
     config={
         "model": "TinyUNet",
         "epochs": EPOCHS,
