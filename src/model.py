@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 def conv3(in_c, out_c, stride=1):
     return nn.Conv2d(in_c, out_c, kernel_size=3, stride=stride, padding=1)
@@ -11,20 +10,25 @@ def conv1(in_c, out_c):
 class ResBlock(nn.Module):
     def __init__(self, ch):
         super().__init__()
+        self.norm1 = nn.InstanceNorm2d(ch, affine=True)
         self.c1 = conv3(ch, ch, stride=1)
+        self.norm2 = nn.InstanceNorm2d(ch, affine=True)
         self.c2 = conv3(ch, ch, stride=1)
         self.act = nn.SiLU(inplace=True)
 
+        # skalowanie residualu
         self.alpha = nn.Parameter(torch.ones(ch))
 
+        # zero-init drugiej konw
         nn.init.zeros_(self.c2.weight)
         if self.c2.bias is not None:
             nn.init.zeros_(self.c2.bias)
 
     def forward(self, x):
-        y = self.act(self.c1(x))
-        y = self.c2(y)
+        y = self.c1(self.act(self.norm1(x)))
+        y = self.c2(self.act(self.norm2(y)))
         return self.act(x + self.alpha.view(1,-1,1,1) * y)
+
 
 class TinyUNet(nn.Module):
     """
@@ -109,6 +113,6 @@ class TinyUNet(nn.Module):
         # Skip 32x32
         y  = torch.cat([y, y1], dim=1)   # (base + base) -> 2*base
         y  = self.act(self.skip_mix(y))  # z powrotem do 'base'
-        
+
         y = x + self.out(y)
         return y.clamp(0.0, 1.0)
