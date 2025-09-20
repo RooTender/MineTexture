@@ -2,11 +2,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from functools import lru_cache
 from typing import List
-from torchvision.io import read_image, ImageReadMode
 import math
 from tqdm import tqdm
+from functools import lru_cache
 
 TARGET = 32
 
@@ -18,6 +17,7 @@ def _get_overlap_anchors(length: int, win: int) -> List[int]:
     k = n - 1
     return [(i * L) // k for i in range(n)]
 
+@torch.no_grad()
 def _crop_pad_32_at_uint8(t: torch.Tensor, x: int, y: int) -> torch.Tensor:
     """
     t: [4,H,W] uint8. Returns [4,32,32] uint8. Center-pad if H/W < 32.
@@ -43,31 +43,13 @@ def _crop_pad_32_at_uint8(t: torch.Tensor, x: int, y: int) -> torch.Tensor:
     pad_right= TARGET - crop_w - pad_left if crop_w < TARGET else 0
 
     # F.pad pads last dims: (left, right, top, bottom)
-    return F.pad(patch, (pad_left, pad_right, pad_top, pad_bot))
-
-@lru_cache(maxsize=4096)
-def _read_rgba_uint8_resized(path: str, scale: int) -> torch.Tensor:
-    """
-    Fast decode PNG → [4,H,W] uint8 (0..255), optional resize (nearest).
-    Cached per (path, scale) in each worker process.
-    """
-    img = read_image(path, mode=ImageReadMode.RGB_ALPHA)  # [4,H,W] uint8
-    if scale != 1:
-        # resize in float to use interpolate, then round back to uint8
-        f = img.float().unsqueeze(0)  # [1,4,H,W]
-        _, _, H, W = f.shape
-        f = F.interpolate(
-            f, size=(H * scale, W * scale),
-            mode="nearest"
-        )
-        img = f.squeeze(0).round().to(torch.uint8)
-    return img  # [4,H',W'] uint8
+    return F.pad(patch, (pad_left, pad_right, pad_top, pad_bot)).contiguous()
 
 class TexturePairDataset(Dataset):
-    def __init__(self, path_a: Path, path_b: Path, scale: int):
+    def __init__(self, path_a: Path, path_b: Path, scale: int = 1):
         self.path_a = Path(path_a)
         self.path_b = Path(path_b)
-        self.scale = int(scale)
+        self.scale  = int(scale)
         self.items: list[tuple[Path, Path, int | None, int | None]] = []
 
         THRESHOLD_FULL = 0.01
@@ -78,11 +60,11 @@ class TexturePairDataset(Dataset):
             w, h = map(int, size_dir.name.lower().split("x"))
             target_dir = self.path_b / f"{w*self.scale}x{h*self.scale}"
 
-            for img_orig in sorted(size_dir.glob("*.png")):
+            for img_orig in sorted(size_dir.glob("*.pt")):
                 img_target = target_dir / img_orig.name
 
-                a_u8 = _read_rgba_uint8_resized(img_orig, self.scale)  # [4,Hs,Ws]
-                b_u8 = _read_rgba_uint8_resized(img_target, 1)
+                a_u8 = torch.load(img_orig, weights_only=True, map_location="cpu")
+                b_u8 = torch.load(img_target, weights_only=True, map_location="cpu")
                 alpha = a_u8[3]
                 h, w = alpha.shape
 
@@ -97,49 +79,53 @@ class TexturePairDataset(Dataset):
                 x_anchors = _get_overlap_anchors(w, TARGET)
                 y_anchors = _get_overlap_anchors(h, TARGET)
 
-                cached_crops = []
-                for y in y_anchors:
-                    for x in x_anchors:
-                        if not (alpha[y:(y + TARGET), x:(x + TARGET)] != 0).any():
-                            continue
+                with torch.no_grad():
+                    cached_crops = []
+                    for y in y_anchors:
+                        for x in x_anchors:
+                            if not (alpha[y:(y + TARGET), x:(x + TARGET)] != 0).any():
+                                continue
 
-                        crop = _crop_pad_32_at_uint8(a_u8, x, y)
+                            crop = _crop_pad_32_at_uint8(a_u8, x, y)
 
-                        redundant_crop = False
-                        for cached in cached_crops:
-                            with torch.no_grad():
-                                diff = (cached[:3] - crop[:3]).abs().sum().item()
-                                diff /= (3 * TARGET * TARGET * 255.0)
+                            redundant_crop = False
+                            for cached in cached_crops:
+                                diff_num = (cached[:3].to(torch.int16) - crop[:3].to(torch.int16)).abs_().sum().item()
+                                diff = diff_num / (3 * h * w * 255.0)
 
-                            if diff < THRESHOLD_CROP:
-                                redundant_crop = True
-                                break
+                                if diff < THRESHOLD_CROP:
+                                    redundant_crop = True
+                                    break
 
-                        if redundant_crop:
-                            continue
+                            if redundant_crop:
+                                continue
 
-                        cached_crops.append(crop)
-
-                        self.items.append((str(img_orig), str(img_target), x, y))
+                            cached_crops.append(crop)
+                            self.items.append((str(img_orig), str(img_target), x, y))
 
     def __len__(self) -> int:
         return len(self.items)
+    
+    @lru_cache(maxsize=1024)
+    def _load_pt_cached(self, path: str) -> torch.Tensor:
+        # uint8 [4, H, W]
+        return torch.load(path, map_location="cpu", weights_only=True)
 
     def __getitem__(self, idx: int):
         orig, target, x, y = self.items[idx]
 
-        a_u8 = _read_rgba_uint8_resized(orig, self.scale)   # [4,H,W] uint8
-        b_u8 = _read_rgba_uint8_resized(target, 1)          # [4,H,W] uint8
+        a_u8 = self._load_pt_cached(orig)
+        b_u8 = self._load_pt_cached(target)
 
         a32_u8 = _crop_pad_32_at_uint8(a_u8, x, y)          # [4,32,32] uint8
         b32_u8 = _crop_pad_32_at_uint8(b_u8, x, y)          # [4,32,32] uint8
 
-        # convert at the end; avoid .clone(), just to(float)/div_
-        a32 = a32_u8.to(torch.float32).mul_(1.0 / 255.0)
-        b32 = b32_u8.to(torch.float32).mul_(1.0 / 255.0)
+        return Path(orig).name, a32_u8, b32_u8
 
-        return {
-            "basename": Path(orig).name,
-            "input": a32,
-            "target": b32
-        }
+def collate(batch):
+    # batch: list[(name, a_u8, b_u8)]
+    names = [b[0] for b in batch]
+    a = torch.stack([b[1] for b in batch], dim=0)  # [B,4,32,32] uint8
+    b = torch.stack([b[2] for b in batch], dim=0)
+
+    return names, a, b
