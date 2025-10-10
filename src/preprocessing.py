@@ -3,8 +3,8 @@ from PIL import Image
 import shutil
 import random
 
-src_vanilla = Path("data/vanilla/1.21.4")
-src_styled  = Path("data/styled/Faithful 32x")
+src_vanilla = Path("data/vanilla/1.20.4")
+src_styled  = Path("data/styled/Faithful 32x - 1.20.4")
 dst_root    = Path("data/sorted")
 
 SCALE = 2  # expected ratio styled/vanilla

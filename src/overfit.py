@@ -11,13 +11,13 @@ from tqdm import tqdm
 import wandb
 
 torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.conv.fp32_precision = "tf32" # type: ignore
+torch.backends.cuda.matmul.fp32_precision = "tf32"
 
-WATCH_NAMES = ['bow.pt', 'seagrass_0.pt', 'raw_copper_block.pt', 'comparator.pt']
+WATCH_NAMES = ['crossbow_pulling_0.pt', 'kelp_18.pt', 'raw_copper_block.pt', 'comparator.pt']
 
-EPOCHS        = 250
-BATCH_SIZE    = 512
+EPOCHS        = 100
+BATCH_SIZE    = 1024
 LEARNING_RATE = 2e-3
 WEIGHT_DECAY  = 0 # 1e-5
 
@@ -30,11 +30,10 @@ train_ds = TexturePairDataset(
     scale=2,
 )
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                          pin_memory=True, pin_memory_device=DEVICE, drop_last=True)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, pin_memory=True)
 
-model = TinyUNet().to(DEVICE).to(memory_format=torch.channels_last)
-# model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+model = TinyUNet().to(DEVICE).to(memory_format=torch.channels_last) # type: ignore
+model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
 optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, 
                   betas=(0.9, 0.999), fused=True)
@@ -54,7 +53,7 @@ def compute_losses(pred, target):
 
 wandb.init(
     project="MineTexture",
-    name="edge_loss_1+2",
+    name="test",
     config={
         "model": "TinyUNet",
         "epochs": EPOCHS,
@@ -81,7 +80,7 @@ for epoch in range(1, EPOCHS + 1):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16):
+        with torch.autocast(device_type=DEVICE, dtype=torch.float16):
             A = A.float().mul_(1/255.0)
             B = B.float().mul_(1/255.0)
 

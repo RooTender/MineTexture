@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-import src.texture_loader as texture_loader
+import src.old.texture_loader as texture_loader
 
 def update_status(new_status: str):
     root.after(0, lambda: status_label.config(text=new_status))
@@ -46,7 +46,7 @@ def main():
 
     root = tk.Tk()
     root.title("MineTexture")
-    root.geometry("400x200")
+    # root.geometry("400x200")
     root.resizable(False, False)
 
     paned = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
@@ -108,8 +108,4 @@ def main():
     pass
 
 if __name__ == "__main__":
-    vanilla_loader = texture_loader.VanillaTexture()
-    styled_loader = texture_loader.StyledTexture()
-
-    vanilla_loader.setup('1.21.4')
-    styled_loader.setup('Faithful 32x.zip')
+    main()

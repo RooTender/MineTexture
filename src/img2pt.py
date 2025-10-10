@@ -4,7 +4,7 @@ from torchvision.io import read_image, ImageReadMode
 import torch.nn.functional as F
 from tqdm import tqdm
 
-DIR = "split"
+DIR = "augmented"
 
 SRC = Path(f"data/{DIR}")
 DST = Path(f"data/{DIR}_pt")
